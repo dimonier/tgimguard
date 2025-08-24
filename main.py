@@ -180,6 +180,50 @@ def contains_prohibited(text: str) -> bool:
     return any(s.lower() in lowered for s in PROHIBITED_SUBSTRINGS)
 
 
+def _format_user_info(user) -> str:
+    """Build a single-line string combining available user identifiers."""
+    parts: list[str] = []
+    username = getattr(user, "username", None)
+    if username:
+        uname = str(username)
+        parts.append(uname if uname.startswith("@") else f"@{uname}")
+
+    first_name = getattr(user, "first_name", None)
+    last_name = getattr(user, "last_name", None)
+    full_name = " ".join([n for n in [first_name, last_name] if n])
+    if full_name:
+        parts.append(full_name)
+
+    user_id = getattr(user, "id", None)
+    if user_id is not None:
+        parts.append(f"id={user_id}")
+
+    return " | ".join(parts) or "unknown user"
+
+
+def _format_chat_info(chat) -> str:
+    """Build a single-line string combining available chat identifiers."""
+    parts: list[str] = []
+    title = getattr(chat, "title", None)
+    if title:
+        parts.append(str(title))
+
+    username = getattr(chat, "username", None)
+    if username:
+        uname = str(username)
+        parts.append(uname if uname.startswith("@") else f"@{uname}")
+
+    chat_type = getattr(chat, "type", None)
+    if chat_type:
+        parts.append(f"type={chat_type}")
+
+    chat_id = getattr(chat, "id", None)
+    if chat_id is not None:
+        parts.append(f"id={chat_id}")
+
+    return " | ".join(parts) or "unknown chat"
+
+
 @router.message(F.content_type.in_({"photo", "document"}))
 async def on_image(message: Message, bot: Bot) -> None:
     """Handle images sent to group/supergroup chats."""
@@ -232,11 +276,14 @@ async def on_image(message: Message, bot: Bot) -> None:
             owner_id = int(CHAT_OWNER_ID) if CHAT_OWNER_ID else await get_chat_owner_id(bot, message.chat.id)
             if owner_id:
                 try:
+                    user_info = _format_user_info(message.from_user)
+                    chat_info = _format_chat_info(message.chat)
                     await bot.send_message(
                         chat_id=owner_id,
                         text=(
-                            f"User {message.from_user.id} banned in chat {message.chat.id} "
-                            f"for prohibited text in image."
+                            f"User {user_info} banned in chat {chat_info} "
+                            f"for the image containing the following text:"
+                            f"\n\n{text}"
                         ),
                     )
                 except Exception as e:
