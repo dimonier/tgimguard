@@ -3,6 +3,7 @@ import logging
 import logging.handlers
 import os
 import re
+from json import JSONDecodeError
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -204,23 +205,30 @@ async def extract_text_via_openai(image_bytes: bytes) -> str:
         "Return plain text without explanations."
     )
 
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL_ID,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Extract visible text from this image."},
-                    {"type": "image_url", "image_url": {"url": data_url}},
+    # Retry up to 2 times on JSONDecodeError (total 3 attempts)
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL_ID,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Extract visible text from this image."},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    },
                 ],
-            },
-        ],
-        temperature=0,
-    )
+                temperature=0,
+            )
 
-    text = resp.choices[0].message.content or ""
-    return text.strip()
+            text = resp.choices[0].message.content or ""
+            return text.strip()
+        except JSONDecodeError:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(1)
 
 
 def contains_prohibited(text: str) -> bool:
