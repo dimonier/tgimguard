@@ -2,7 +2,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
-from typing import List
+import re
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -50,10 +50,61 @@ def get_env(name: str) -> str:
 
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID", "gpt-4o-mini")
-PROHIBITED_SUBSTRINGS: List[str] = [s for s in os.getenv("PROHIBITED_STRINGS", "").split("|") if s]
 CHAT_OWNER_ID = os.getenv("CHAT_OWNER_ID")  # optional, but recommended
 IMAGE_COMPRESSION_THRESHOLD_KB = int(os.getenv("IMAGE_COMPRESSION_THRESHOLD_KB", "300"))
 IMAGE_RESIZE_WIDTH_PX = int(os.getenv("IMAGE_RESIZE_WIDTH_PX", "800"))
+def _iter_rule_lines(file_path: str) -> list[str]:
+    """Yield non-empty, non-comment trimmed lines from a UTF-8 text file.
+
+    Lines beginning with '#' and blank lines are ignored.
+    """
+    if not os.path.exists(file_path):
+        return []
+    lines: list[str] = []
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                lines.append(line)
+    except Exception as e:
+        logger.warning("Failed to read rules file %s: %s", file_path, e)
+    return lines
+
+
+def _load_prohibited_patterns() -> list[re.Pattern[str]]:
+    """Load prohibited patterns from rules directory.
+
+    - rules/prohibited_literals.txt: plain substrings, case-insensitive
+    - rules/prohibited.regex: regular expressions (Python), flags via inline e.g. (?i)
+    """
+    base_dir = os.path.join(os.path.dirname(__file__), "rules")
+    literal_file = os.path.join(base_dir, "prohibited_literals.txt")
+    regex_file = os.path.join(base_dir, "prohibited.regex")
+
+    patterns: list[re.Pattern[str]] = []
+
+    # Load literals as escaped regex with IGNORECASE
+    for value in _iter_rule_lines(literal_file):
+        try:
+            patterns.append(re.compile(re.escape(value), re.IGNORECASE))
+        except Exception as e:
+            logger.warning("Failed to compile literal rule '%s': %s", value, e)
+
+    # Load regex patterns as-is
+    for expr in _iter_rule_lines(regex_file):
+        try:
+            patterns.append(re.compile(expr))
+        except Exception as e:
+            logger.warning("Failed to compile regex rule '%s': %s", expr, e)
+
+    logger.info("Loaded prohibited patterns: %d (literals+regex)", len(patterns))
+    return patterns
+
+
+PROHIBITED_PATTERNS = _load_prohibited_patterns()
+
 
 
 async def get_chat_owner_id(bot: Bot, chat_id: int) -> int | None:
@@ -173,11 +224,13 @@ async def extract_text_via_openai(image_bytes: bytes) -> str:
 
 
 def contains_prohibited(text: str) -> bool:
-    """Return True if any prohibited substring is in text (case-insensitive)."""
-    if not PROHIBITED_SUBSTRINGS:
+    """Return True if any prohibited pattern matches the text."""
+    if not PROHIBITED_PATTERNS:
         return False
-    lowered = text.lower()
-    return any(s.lower() in lowered for s in PROHIBITED_SUBSTRINGS)
+    for pattern in PROHIBITED_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
 
 
 def _format_user_info(user) -> str:
@@ -224,6 +277,16 @@ def _format_chat_info(chat) -> str:
     return " | ".join(parts) or "unknown chat"
 
 
+def _chat_tag(chat) -> str:
+    """Return a short prefix identifying the chat for log messages."""
+    username = getattr(chat, "username", None)
+    if username:
+        uname = str(username)
+        return f"[{uname if uname.startswith('@') else '@' + uname}]"
+    chat_id = getattr(chat, "id", None)
+    return f"[id={chat_id}]" if chat_id is not None else "[id=?]"
+
+
 @router.message(F.content_type.in_({"photo", "document"}))
 async def on_image(message: Message, bot: Bot) -> None:
     """Handle images sent to group/supergroup chats."""
@@ -252,25 +315,25 @@ async def on_image(message: Message, bot: Bot) -> None:
                 image_bytes = await resp.read()
 
         text = await extract_text_via_openai(image_bytes)
-        logger.info("OCR extracted %d chars", len(text))
+        logger.info("%s OCR extracted %d chars", _chat_tag(message.chat), len(text))
         preview = " ".join(text.split())[:50]
-        logger.info("OCR text preview: %s", preview)
+        logger.info("%s OCR text preview: %s", _chat_tag(message.chat), preview)
 
         is_prohibited = contains_prohibited(text)
-        logger.info("Image evaluation: %s", "prohibited" if is_prohibited else "OK")
+        logger.info("%s Image evaluation: %s", _chat_tag(message.chat), "prohibited" if is_prohibited else "OK")
 
         if is_prohibited:
             # Delete message
             try:
                 await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
             except Exception as e:
-                logger.warning("Failed to delete message: %s", e)
+                logger.warning("%s Failed to delete message: %s", _chat_tag(message.chat), e)
 
             # Ban user
             try:
                 await bot.ban_chat_member(chat_id=message.chat.id, user_id=message.from_user.id)
             except Exception as e:
-                logger.warning("Failed to ban user: %s", e)
+                logger.warning("%s Failed to ban user: %s", _chat_tag(message.chat), e)
 
             # Notify owner: env first, otherwise autodetect creator
             owner_id = int(CHAT_OWNER_ID) if CHAT_OWNER_ID else await get_chat_owner_id(bot, message.chat.id)
@@ -287,9 +350,9 @@ async def on_image(message: Message, bot: Bot) -> None:
                         ),
                     )
                 except Exception as e:
-                    logger.warning("Failed to notify owner: %s", e)
+                    logger.warning("%s Failed to notify owner: %s", _chat_tag(message.chat), e)
     except Exception as e:
-        logger.exception("Image handling error: %s", e)
+        logger.exception("%s Image handling error: %s", _chat_tag(message.chat), e)
 
 
 async def main() -> None:
